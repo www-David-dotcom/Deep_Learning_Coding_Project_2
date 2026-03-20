@@ -4,6 +4,7 @@ from argparse import ArgumentParser
 from pathlib import Path
 
 import torch
+from torch import Tensor
 from torch.utils.data import DataLoader
 from torchvision.transforms.v2 import (
     Compose,
@@ -19,6 +20,56 @@ from evaluate import DATASET_ROOT, DEVICE, TRANSFORM
 from modules import CustomModel
 
 
+class ModelEMA:
+    def __init__(self, model: torch.nn.Module, decay: float) -> None:
+        self.decay = decay
+        self.state_dict = {
+            name: tensor.detach().clone()
+            for name, tensor in model.state_dict().items()
+        }
+
+    @torch.no_grad()
+    def update(self, model: torch.nn.Module) -> None:
+        model_state = model.state_dict()
+        for name, ema_tensor in self.state_dict.items():
+            model_tensor = model_state[name].detach()
+            if torch.is_floating_point(ema_tensor):
+                ema_tensor.lerp_(model_tensor, 1.0 - self.decay)
+            else:
+                ema_tensor.copy_(model_tensor)
+
+    def copy_to(self, model: torch.nn.Module) -> None:
+        model.load_state_dict(self.state_dict)
+
+
+def mixup_batch(images: Tensor, labels: Tensor, alpha: float) -> tuple[Tensor, Tensor, Tensor, float]:
+    lam = torch.distributions.Beta(alpha, alpha).sample().item()
+    index = torch.randperm(images.size(0), device=images.device)
+    mixed_images = lam * images + (1.0 - lam) * images[index]
+    return mixed_images, labels, labels[index], lam
+
+
+def cutmix_batch(images: Tensor, labels: Tensor, alpha: float) -> tuple[Tensor, Tensor, Tensor, float]:
+    lam = torch.distributions.Beta(alpha, alpha).sample().item()
+    index = torch.randperm(images.size(0), device=images.device)
+
+    _, _, height, width = images.shape
+    cut_ratio = (1.0 - lam) ** 0.5
+    cut_w = int(width * cut_ratio)
+    cut_h = int(height * cut_ratio)
+    center_x = torch.randint(width, (1,), device=images.device).item()
+    center_y = torch.randint(height, (1,), device=images.device).item()
+
+    x1 = max(center_x - cut_w // 2, 0)
+    x2 = min(center_x + cut_w // 2, width)
+    y1 = max(center_y - cut_h // 2, 0)
+    y2 = min(center_y + cut_h // 2, height)
+
+    images[:, :, y1:y2, x1:x2] = images[index, :, y1:y2, x1:x2]
+    lam = 1.0 - ((x2 - x1) * (y2 - y1) / (width * height))
+    return images, labels, labels[index], lam
+
+
 def train(model: CustomModel, dataset: TinyImageNetDataset) -> None:
     train_transform = Compose(
         [
@@ -32,13 +83,19 @@ def train(model: CustomModel, dataset: TinyImageNetDataset) -> None:
     dataset.transform = train_transform
 
     batch_size = 128
-    num_workers = min(8, os.cpu_count() or 1)
-    pin_memory = (DEVICE.type == "cuda")
+    num_workers = 8
+    ema_decay = 0.999
+    mix_alpha = 0.2
+    # pin-memory means page_locked memory, making data transfer from CPU to GPU faster
+    pin_memory = (DEVICE.type == "cuda") 
+    # automatic mixed precision
     use_amp = (DEVICE.type == "cuda")
+    # tels pytorch to automatically choose lower precision for safe operations,
+    # but keep sensitive operations to higher precision
     autocast_device = "cuda" if use_amp else "cpu"
 
     if use_amp:
-        torch.backends.cudnn.benchmark = True
+        torch.backends.cudnn.benchmark = True # tell cuda to try different conv algorithms and choose the fastest one
 
     train_loader = DataLoader(
         dataset,
@@ -46,8 +103,8 @@ def train(model: CustomModel, dataset: TinyImageNetDataset) -> None:
         shuffle=True,
         num_workers=num_workers,
         pin_memory=pin_memory,
-        persistent_workers=True,
-        prefetch_factor=4,
+        persistent_workers=True, # workers in dataloader stay alive from epoch to epoch, not recreated
+        prefetch_factor=4, # num of batches each worker prepares in advance
     )
 
     epochs = 60
@@ -57,21 +114,25 @@ def train(model: CustomModel, dataset: TinyImageNetDataset) -> None:
         lr=lr, 
         momentum=0.9, 
         weight_decay=5e-4,
-        nesterov=True,
+        nesterov=True, # using nesterov momentum
     )
-    criterion = torch.nn.CrossEntropyLoss(label_smoothing=0.1)
+    criterion = torch.nn.CrossEntropyLoss()
     scaler = torch.amp.GradScaler("cuda",enabled=use_amp)
+    ema = ModelEMA(model, decay=ema_decay)
 
     steps_per_epoch = len(train_loader)
     warmup_epochs = 5
     warmup_steps = warmup_epochs * steps_per_epoch
     total_steps = epochs * steps_per_epoch
+    # a scheduler changes the learning rate during training
+    # high lr is useful early, lower lr is useful later for refinement
     warmup_scheduler = torch.optim.lr_scheduler.LinearLR(
         optimizer,
         start_factor=0.1,
         end_factor=1.0,
         total_iters=warmup_steps,
     )
+    # cosine annealing is smooth decay, it often works well for img classification
     cosine_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
         optimizer,
         T_max=max(1, total_steps - warmup_steps),
@@ -93,20 +154,30 @@ def train(model: CustomModel, dataset: TinyImageNetDataset) -> None:
         for images, labels in train_loader:
             images = images.to(DEVICE, non_blocking=pin_memory)
             labels = labels.to(DEVICE, non_blocking=pin_memory)
+
+            if torch.rand(1).item() < 0.5:
+                images, labels_a, labels_b, lam = mixup_batch(images, labels, mix_alpha)
+            else:
+                images, labels_a, labels_b, lam = cutmix_batch(images, labels, mix_alpha)
+
             optimizer.zero_grad(set_to_none=True)
 
             with torch.amp.autocast(autocast_device, enabled=use_amp):
                 logits = model(images)
-                loss = criterion(logits, labels)
+                loss = lam * criterion(logits, labels_a) + (1.0 - lam) * criterion(logits, labels_b)
             
-            scaler.scale(loss).backward()
+            scaler.scale(loss).backward() # scale it to avoid zero gradient
             scaler.step(optimizer)
             scaler.update()
+            ema.update(model)
             scheduler.step()
 
             preds = logits.argmax(dim=1)
             running_loss += loss.item() * labels.size(0)
-            running_corrects += (preds == labels).sum().item()
+            running_corrects += (
+                lam * (preds == labels_a).sum().item()
+                + (1.0 - lam) * (preds == labels_b).sum().item()
+            )
             running_samples += labels.size(0)
 
         train_loss = running_loss / running_samples
@@ -119,6 +190,8 @@ def train(model: CustomModel, dataset: TinyImageNetDataset) -> None:
             f"train_loss={train_loss:.4f} | "
             f"train_acc={train_acc:.4f}"
         )
+
+    ema.copy_to(model)
 
 
 def main() -> None:
