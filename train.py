@@ -10,13 +10,12 @@ from torchvision.transforms.v2 import (
     Compose,
     Normalize,
     RandomCrop,
-    RandomErasing,
     RandomHorizontalFlip,
     ToDtype,
 )
 
 from datasets import TinyImageNetDataset
-from evaluate import DATASET_ROOT, DEVICE, TRANSFORM
+from evaluate import DATASET_ROOT, DEVICE, TRANSFORM, evaluate
 from modules import CustomModel
 
 
@@ -70,6 +69,13 @@ def cutmix_batch(images: Tensor, labels: Tensor, alpha: float) -> tuple[Tensor, 
     return images, labels, labels[index], lam
 
 
+def clone_state_dict_to_cpu(state_dict: dict[str, Tensor]) -> dict[str, Tensor]:
+    return {
+        name: tensor.detach().cpu().clone()
+        for name, tensor in state_dict.items()
+    }
+
+
 def train(model: CustomModel, dataset: TinyImageNetDataset) -> None:
     train_transform = Compose(
         [
@@ -77,13 +83,15 @@ def train(model: CustomModel, dataset: TinyImageNetDataset) -> None:
             RandomHorizontalFlip(),
             ToDtype(torch.float32, scale=True),
             Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
-            RandomErasing(p=0.25)
         ]
     )
     dataset.transform = train_transform
+    val_dataset = TinyImageNetDataset(DATASET_ROOT, "val", transform=TRANSFORM)
 
     batch_size = 128
-    num_workers = 8
+    val_batch_size = 256
+    val_interval = 10
+    num_workers = min(8, os.cpu_count() or 1)
     ema_decay = 0.999
     mix_alpha = 0.2
     # pin-memory means page_locked memory, making data transfer from CPU to GPU faster
@@ -108,7 +116,7 @@ def train(model: CustomModel, dataset: TinyImageNetDataset) -> None:
     )
 
     epochs = 60
-    lr = 0.1 * batch_size / 256
+    lr = 0.08
     optimizer = torch.optim.SGD(
         model.parameters(), 
         lr=lr, 
@@ -119,9 +127,11 @@ def train(model: CustomModel, dataset: TinyImageNetDataset) -> None:
     criterion = torch.nn.CrossEntropyLoss()
     scaler = torch.amp.GradScaler("cuda",enabled=use_amp)
     ema = ModelEMA(model, decay=ema_decay)
+    best_val_acc = 0.0
+    best_state_dict = clone_state_dict_to_cpu(ema.state_dict)
 
     steps_per_epoch = len(train_loader)
-    warmup_epochs = 5
+    warmup_epochs = 2
     warmup_steps = warmup_epochs * steps_per_epoch
     total_steps = epochs * steps_per_epoch
     # a scheduler changes the learning rate during training
@@ -155,10 +165,7 @@ def train(model: CustomModel, dataset: TinyImageNetDataset) -> None:
             images = images.to(DEVICE, non_blocking=pin_memory)
             labels = labels.to(DEVICE, non_blocking=pin_memory)
 
-            if torch.rand(1).item() < 0.5:
-                images, labels_a, labels_b, lam = mixup_batch(images, labels, mix_alpha)
-            else:
-                images, labels_a, labels_b, lam = cutmix_batch(images, labels, mix_alpha)
+            images, labels_a, labels_b, lam = mixup_batch(images, labels, mix_alpha)
 
             optimizer.zero_grad(set_to_none=True)
 
@@ -182,16 +189,35 @@ def train(model: CustomModel, dataset: TinyImageNetDataset) -> None:
 
         train_loss = running_loss / running_samples
         train_acc = running_corrects / running_samples
+        should_validate = ((epoch + 1) % val_interval == 0) or (epoch + 1 == epochs)
+        val_acc = None
+        if should_validate:
+            raw_state_dict = clone_state_dict_to_cpu(model.state_dict())
+            ema.copy_to(model)
+            val_acc = evaluate(
+                model,
+                val_dataset,
+                batch_size=val_batch_size,
+                num_workers=num_workers,
+                pin_memory=pin_memory,
+            )
+            if val_acc > best_val_acc:
+                best_val_acc = val_acc
+                best_state_dict = clone_state_dict_to_cpu(model.state_dict())
+            model.load_state_dict(raw_state_dict)
         
         current_lr = optimizer.param_groups[0]["lr"]
+        val_acc_text = f"{val_acc:.4f}" if val_acc is not None else "skipped"
         logging.info(
             f"Epoch {epoch + 1:03d}/{epochs} | "
             f"lr={current_lr:.5f} | "
             f"train_loss={train_loss:.4f} | "
-            f"train_acc={train_acc:.4f}"
+            f"train_acc={train_acc:.4f} | "
+            f"val_acc={val_acc_text} | "
+            f"best_val_acc={best_val_acc:.4f}"
         )
 
-    ema.copy_to(model)
+    model.load_state_dict(best_state_dict)
 
 
 def main() -> None:
