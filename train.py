@@ -15,17 +15,18 @@ from torchvision.transforms.v2 import (
 )
 
 from datasets import TinyImageNetDataset
-from evaluate import DATASET_ROOT, DEVICE, TRANSFORM, evaluate
+from evaluate import DATASET_ROOT, DEVICE, TRANSFORM
 from modules import CustomModel
 
 
 class ModelEMA:
+    """
+    Exponential Moving average. It keeps a smoother copy of the weights
+    """
     def __init__(self, model: torch.nn.Module, decay: float) -> None:
         self.decay = decay
-        self.state_dict = {
-            name: tensor.detach().clone()
-            for name, tensor in model.state_dict().items()
-        }
+        # clone the state dict
+        self.state_dict = { name: tensor.detach().clone() for name, tensor in model.state_dict().items()}
 
     @torch.no_grad()
     def update(self, model: torch.nn.Module) -> None:
@@ -33,6 +34,7 @@ class ModelEMA:
         for name, ema_tensor in self.state_dict.items():
             model_tensor = model_state[name].detach()
             if torch.is_floating_point(ema_tensor):
+                # lerp: linear interpolation x<-x + w(y-x)
                 ema_tensor.lerp_(model_tensor, 1.0 - self.decay)
             else:
                 ema_tensor.copy_(model_tensor)
@@ -41,18 +43,18 @@ class ModelEMA:
         model.load_state_dict(self.state_dict)
 
 
-def mixup_batch(images: Tensor, labels: Tensor, alpha: float) -> tuple[Tensor, Tensor, Tensor, float]:
-    lam = torch.distributions.Beta(alpha, alpha).sample().item()
-    index = torch.randperm(images.size(0), device=images.device)
-    mixed_images = lam * images + (1.0 - lam) * images[index]
-    return mixed_images, labels, labels[index], lam
-
-
 def cutmix_batch(images: Tensor, labels: Tensor, alpha: float) -> tuple[Tensor, Tensor, Tensor, float]:
+    """
+    augment the data by cutting one rectangle of an image to the other
+    """
+
+    # create a sample of a beta distribution, called \lambda
     lam = torch.distributions.Beta(alpha, alpha).sample().item()
+    # do a random permutation
     index = torch.randperm(images.size(0), device=images.device)
 
     _, _, height, width = images.shape
+    # cut a random rectangular area
     cut_ratio = (1.0 - lam) ** 0.5
     cut_w = int(width * cut_ratio)
     cut_h = int(height * cut_ratio)
@@ -64,7 +66,9 @@ def cutmix_batch(images: Tensor, labels: Tensor, alpha: float) -> tuple[Tensor, 
     y1 = max(center_y - cut_h // 2, 0)
     y2 = min(center_y + cut_h // 2, height)
 
+    # replace the rectangle
     images[:, :, y1:y2, x1:x2] = images[index, :, y1:y2, x1:x2]
+    # set the lambda to the true replacement area ratio
     lam = 1.0 - ((x2 - x1) * (y2 - y1) / (width * height))
     return images, labels, labels[index], lam
 
@@ -86,14 +90,11 @@ def train(model: CustomModel, dataset: TinyImageNetDataset) -> None:
         ]
     )
     dataset.transform = train_transform
-    val_dataset = TinyImageNetDataset(DATASET_ROOT, "val", transform=TRANSFORM)
 
     batch_size = 128
-    val_batch_size = 256
-    val_interval = 10
     num_workers = min(8, os.cpu_count() or 1)
     ema_decay = 0.999
-    mix_alpha = 0.2
+    cutmix_alpha = 0.2
     # pin-memory means page_locked memory, making data transfer from CPU to GPU faster
     pin_memory = (DEVICE.type == "cuda") 
     # automatic mixed precision
@@ -115,7 +116,7 @@ def train(model: CustomModel, dataset: TinyImageNetDataset) -> None:
         prefetch_factor=4, # num of batches each worker prepares in advance
     )
 
-    epochs = 60
+    epochs = 50
     lr = 0.08
     optimizer = torch.optim.SGD(
         model.parameters(), 
@@ -127,8 +128,6 @@ def train(model: CustomModel, dataset: TinyImageNetDataset) -> None:
     criterion = torch.nn.CrossEntropyLoss()
     scaler = torch.amp.GradScaler("cuda",enabled=use_amp)
     ema = ModelEMA(model, decay=ema_decay)
-    best_val_acc = 0.0
-    best_state_dict = clone_state_dict_to_cpu(ema.state_dict)
 
     steps_per_epoch = len(train_loader)
     warmup_epochs = 2
@@ -165,12 +164,13 @@ def train(model: CustomModel, dataset: TinyImageNetDataset) -> None:
             images = images.to(DEVICE, non_blocking=pin_memory)
             labels = labels.to(DEVICE, non_blocking=pin_memory)
 
-            images, labels_a, labels_b, lam = mixup_batch(images, labels, mix_alpha)
+            images, labels_a, labels_b, lam = cutmix_batch(images, labels, cutmix_alpha)
 
             optimizer.zero_grad(set_to_none=True)
 
             with torch.amp.autocast(autocast_device, enabled=use_amp):
                 logits = model(images)
+                # uses mixed labels loss
                 loss = lam * criterion(logits, labels_a) + (1.0 - lam) * criterion(logits, labels_b)
             
             scaler.scale(loss).backward() # scale it to avoid zero gradient
@@ -181,6 +181,7 @@ def train(model: CustomModel, dataset: TinyImageNetDataset) -> None:
 
             preds = logits.argmax(dim=1)
             running_loss += loss.item() * labels.size(0)
+            # use mixed label correctness
             running_corrects += (
                 lam * (preds == labels_a).sum().item()
                 + (1.0 - lam) * (preds == labels_b).sum().item()
@@ -189,35 +190,16 @@ def train(model: CustomModel, dataset: TinyImageNetDataset) -> None:
 
         train_loss = running_loss / running_samples
         train_acc = running_corrects / running_samples
-        should_validate = ((epoch + 1) % val_interval == 0) or (epoch + 1 == epochs)
-        val_acc = None
-        if should_validate:
-            raw_state_dict = clone_state_dict_to_cpu(model.state_dict())
-            ema.copy_to(model)
-            val_acc = evaluate(
-                model,
-                val_dataset,
-                batch_size=val_batch_size,
-                num_workers=num_workers,
-                pin_memory=pin_memory,
-            )
-            if val_acc > best_val_acc:
-                best_val_acc = val_acc
-                best_state_dict = clone_state_dict_to_cpu(model.state_dict())
-            model.load_state_dict(raw_state_dict)
         
         current_lr = optimizer.param_groups[0]["lr"]
-        val_acc_text = f"{val_acc:.4f}" if val_acc is not None else "skipped"
         logging.info(
             f"Epoch {epoch + 1:03d}/{epochs} | "
             f"lr={current_lr:.5f} | "
             f"train_loss={train_loss:.4f} | "
-            f"train_acc={train_acc:.4f} | "
-            f"val_acc={val_acc_text} | "
-            f"best_val_acc={best_val_acc:.4f}"
+            f"train_acc={train_acc:.4f}"
         )
 
-    model.load_state_dict(best_state_dict)
+    ema.copy_to(model)
 
 
 def main() -> None:
