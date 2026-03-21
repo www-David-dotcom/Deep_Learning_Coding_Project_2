@@ -130,7 +130,7 @@ def train(model: CustomModel, dataset: TinyImageNetDataset) -> None:
     ema = ModelEMA(model, decay=ema_decay)
 
     steps_per_epoch = len(train_loader)
-    warmup_epochs = 2
+    warmup_epochs = 5
     warmup_steps = warmup_epochs * steps_per_epoch
     total_steps = epochs * steps_per_epoch
     # a scheduler changes the learning rate during training

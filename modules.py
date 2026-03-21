@@ -72,7 +72,7 @@ class CustomModel(nn.Module):
         super().__init__()
 
         # YOUR CODE BEGIN.
-        depth = 16 # how many res layers the whole network has
+        depth = 22 # how many res layers the whole network has
         # this is what wide ResNet is different from general ResNets
         widen_factor = 8 # multiplies the channel width of the main stages, larger means each layers have more feature channels
         conv1_channels = 16
